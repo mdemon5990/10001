@@ -324,7 +324,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             unjoined = await get_unjoined_channels(context, token, user.id)
             if unjoined:
                 kb = []
-                for i, ch in enumerate(unjoined): kb.append([InlineKeyboardButton(f"📢 Join Channel {i+1}", url=ch['link'])])
+                # এখানে ডাইনামিক বাটন ফিক্স করা হয়েছে: সবগুলো ফোর্স চ্যানেল শো করবে 
+                all_channels = get_force_channels(token)
+                for i, ch in enumerate(all_channels): 
+                    kb.append([InlineKeyboardButton(f"📢 Join Channel {i+1}", url=ch['link'])])
                 kb.append([InlineKeyboardButton("✅ Check Joined", callback_data="check_joined_member")])
                 
                 await update.message.reply_text(
@@ -935,6 +938,7 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
         await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML)
         return
 
+    # এখানে চেক মেম্বার এও ডাইনামিক বাটন ফিক্স করা হয়েছে
     elif data == "check_joined_member":
         unjoined = await get_unjoined_channels(context, token, query.from_user.id)
         if not unjoined:
@@ -964,7 +968,20 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
             kb = await user_keyboard(token, user_id)
             await context.bot.send_message(chat_id=query.from_user.id, text="✅ জয়েন করা সফল হয়েছে! এখন আপনি বট ব্যবহার করতে পারবেন।", reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         else:
-            await context.bot.send_message(chat_id=query.from_user.id, text="❌ আপনি এখনো সকল চ্যানেলে জয়েন করেননি!")
+            kb = []
+            all_channels = get_force_channels(token)
+            for i, ch in enumerate(all_channels): 
+                kb.append([InlineKeyboardButton(f"📢 Join Channel {i+1}", url=ch['link'])])
+            kb.append([InlineKeyboardButton("✅ Check Joined", callback_data="check_joined_member")])
+            
+            try:
+                await query.edit_message_text(
+                    text="❌ *আপনি এখনো সকল চ্যানেলে জয়েন করেননি!*\nদয়া করে নিচের সবগুলো চ্যানেলে জয়েন করে আবার চেক করুন।",
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception:
+                await query.answer("❌ আপনি এখনো সকল চ্যানেলে জয়েন করেননি!", show_alert=True)
         return
 
     elif data == "adm_block":
