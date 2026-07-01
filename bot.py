@@ -29,6 +29,7 @@ from telegram.ext import (
     CommandHandler, 
     MessageHandler, 
     CallbackQueryHandler, 
+    ChatJoinRequestHandler,
     filters, 
     ContextTypes
 )
@@ -188,11 +189,15 @@ async def get_unjoined_channels(context: ContextTypes.DEFAULT_TYPE, token, user_
     not_joined = []
     for ch in channels:
         cid = ch['id']
-        # 🟢 ফিক্স: প্রাইভেট চ্যানেল/গ্রুপের আইডি Integer এ কনভার্ট করা হচ্ছে
         check_id = int(cid) if (isinstance(cid, str) and (cid.lstrip('-').isdigit())) else cid
+        
+        # 🟢 ফিক্স: Join Request চেক বাইপাস। ইউজার রিকোয়েস্ট পাঠিয়ে থাকলে তাকে জয়েন ধরা হবে।
+        if db.get_val(token, f"join_req_{user_id}_{check_id}", False):
+            continue
+
         try:
             member = await context.bot.get_chat_member(chat_id=check_id, user_id=user_id)
-            if member.status not in ['member', 'administrator', 'creator']:
+            if member.status not in ['member', 'administrator', 'creator', 'restricted']:
                 not_joined.append(ch)
         except Exception as e:
             logger.error(f"Force Join Check Error for {cid}: {e}")
@@ -207,6 +212,15 @@ def format_timestamp(ts):
         dt = datetime.fromtimestamp(ts / 1000, TIMEZONE)
         return dt.strftime("%d/%m/%Y %I:%M %p")
     except: return "Unknown"
+
+# 🟢 নতুন হ্যান্ডলার: Join Request রিসিভ করার জন্য
+async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.chat_join_request:
+        user_id = str(update.chat_join_request.from_user.id)
+        chat_id = str(update.chat_join_request.chat.id)
+        token = context.bot.token
+        # ডাটাবেসে সেভ করে দিচ্ছি যেন পরে চেকিং বাইপাস করতে পারে
+        db.set_val(token, f"join_req_{user_id}_{chat_id}", True)
 
 # ==========================================
 # 🎛 KEYBOARDS
@@ -316,18 +330,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_check = db.get_val(token, f"last_join_check_{user_id}", 0)
         current_time = time.time()
         
-        if current_time - last_check > 86400: 
+        # 🟢 ফিক্স: 30 ঘন্টা (108000 সেকেন্ড) পর পর চেক করবে
+        if current_time - last_check > 108000: 
             unjoined = await get_unjoined_channels(context, token, user.id)
             if unjoined:
                 kb = []
-                # 🟢 ডাইনামিক বাটন: যতগুলো চ্যানেল দেওয়া আছে, ঠিক ততগুলো বাটন জেনারেট হবে
                 all_channels = get_force_channels(token)
                 for i, ch in enumerate(all_channels): 
                     kb.append([InlineKeyboardButton(f"📢 Join Channel {i+1}", url=ch['link'])])
                 kb.append([InlineKeyboardButton("✅ Check Joined", callback_data="check_joined_member")])
                 
                 await update.message.reply_text(
-                    "📢 *চ্যানেলে জয়েন করা বাধ্যতামূলক!*\n\nবটটি ব্যবহার করতে হলে আমাদের অফিশিয়াল চ্যানেলে বা গ্রুপে জয়েন করুন। জয়েন না করলে বটের কোনো ফিচার কাজ করবে না।",
+                    "📢 *চ্যানেলে জয়েন করা বাধ্যতামূলক!*\n\nবটটি ব্যবহার করতে হলে আমাদের অফিশিয়াল চ্যানেলে বা গ্রুপে জয়েন করুন। জয়েন হলে চেক বাটনে ক্লিক করুন)।",
                     reply_markup=InlineKeyboardMarkup(kb),
                     parse_mode=ParseMode.MARKDOWN
                 )
@@ -414,6 +428,13 @@ async def handle_user_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         if db.get_val(token, "is_maintenance", False) and not await is_bot_admin(token, user_id):
             await update.message.reply_text("⚠️ *System Maintenance* ⚠️\n\nবর্তমানে SMS সার্ভার মেইনটেনেন্সে আছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।")
             return
+            
+        # 🟢 ফিক্স: ক্লোন বটের টোকেনের মেয়াদ চেক (SMS পাঠানোর সময় ব্লক করবে)
+        if token != MASTER_BOT_TOKEN and not await is_bot_admin(token, user_id):
+            t_exp = db.get_val(token, "token_expiry_time", "life")
+            if t_exp != "life" and int(time.time() * 1000) > t_exp:
+                await update.message.reply_text("🚫 *সার্ভার টোকেন মেয়াদ শেষ!*\n\nএই বটের SMS টোকেনের মেয়াদ শেষ হয়ে গেছে। বটের অন্যান্য মেনু ও ফিচার সচল আছে কিন্তু SMS পাঠানো সাময়িকভাবে বন্ধ রয়েছে। অনুগ্রহ করে বটের এডমিনের সাথে যোগাযোগ করুন।", parse_mode=ParseMode.MARKDOWN)
+                return
 
         last_sms_time = db.get_val(token, f"last_sms_{user_id}", 0)
         if not await is_bot_admin(token, user_id) and (time.time() - last_sms_time < 5):
@@ -815,6 +836,12 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
         return
         
     elif data == "flow_paid_sms":
+        if token != MASTER_BOT_TOKEN and not await is_bot_admin(token, user_id):
+            t_exp = db.get_val(token, "token_expiry_time", "life")
+            if t_exp != "life" and int(time.time() * 1000) > t_exp:
+                await context.bot.send_message(chat_id=user_id, text="🚫 *সার্ভার টোকেন মেয়াদ শেষ!*\n\nএই বটের SMS টোকেনের মেয়াদ শেষ হয়ে গেছে।", parse_mode=ParseMode.MARKDOWN)
+                return
+                
         credits = db.get_val(token, f"credits_{user_id}", 0)
         if credits < 1:
             await context.bot.send_message(chat_id=user_id, text="❌ *দুঃখিত, আপনার পর্যাপ্ত ক্রেডিট নেই!*", parse_mode=ParseMode.MARKDOWN)
@@ -1024,7 +1051,7 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
     elif data == "adm_promo_menu":
         if not await is_bot_admin(token, user_id): return
         db.set_val(token, f"adm_step_{user_id}", 'create_promo')
-        await context.bot.send_message(chat_id=user_id, text="🎟️ *নতুন প্রোমো কোড তৈরি:*\n\nবিন্যাস: `[কোড] [টোকেন] [সর্বোচ্চ_ইউজার] [মেয়াদ_দিন]`", reply_markup=ForceReply(selective=True), parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id=user_id, text="🎟️ *নতুন প্রোমো কোড তৈরি:*\n\nবিন্যাস: `[কোড] [টোকেন] [সর্বোচ্চ_ইউজার] [মেয়াদ_দিন]`\nউদাহরণ: `FREE50 50 100 30`", reply_markup=ForceReply(selective=True), parse_mode=ParseMode.MARKDOWN)
         return
 
     elif data == "adm_delpromo_menu":
@@ -1052,7 +1079,6 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # 🟢 ফিক্স: অ্যাডমিন প্যানেল থেকে চ্যানেল যুক্ত করার অপশন
     elif data == "adm_fc_menu":
         if not await is_bot_admin(token, user_id): return
         db.set_val(token, f"adm_step_{user_id}", 'set_force_channel')
@@ -1131,8 +1157,8 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
             chat_id=user_id,
             text="🛡️ *SETUP NEW CLONE BOT*\n━━━━━━━━━━━━━━━━━━\n"
                  "দয়া করে নতুন বটের তথ্যগুলো নিচের বিন্যাসে দিন:\n\n"
-                 "বিন্যাস: `[BotToken] [OwnerID] [Days] [MaxTokens]`\n\n"
-                 "উদাহরণ: `12345:abc 7034779471 30 5000`",
+                 "বিন্যাস: `[BotToken] [OwnerID] [BotLicenseDays] [MaxTokens] [QuotaDays]`\n\n"
+                 "উদাহরণ: `12345:abc 7034779471 30 5000 30`",
             reply_markup=ForceReply(selective=True),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -1180,22 +1206,30 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
         info = clones[target_token]
         safe_user = escape_html(info.get('username', 'Bot'))
         used = db.get_val(target_token, "used_global_tokens", 0)
+        
         bot_expiry = db.get_val(target_token, "bot_expiry_time", "life")
         exp_text = format_timestamp(bot_expiry)
+        
+        # 🟢 ফিক্স: টোকেন মেয়াদ ড্যাশবোর্ডে দেখানো হচ্ছে
+        token_expiry = db.get_val(target_token, "token_expiry_time", "life")
+        t_exp_text = format_timestamp(token_expiry)
+
         is_susp = db.get_val(target_token, "is_suspended", False)
         status = "🔴 Suspended" if is_susp else "🟢 Active"
 
         manage_msg = (
             f"🤖 <b>Bot:</b> @{safe_user}\n"
             f"👑 <b>Owner:</b> <code>{info.get('owner')}</code>\n"
-            f"⏳ <b>License Expiry:</b> <code>{exp_text}</code>\n"
+            f"⏳ <b>Bot License:</b> <code>{exp_text}</code>\n"
+            f"🎫 <b>Token Expiry:</b> <code>{t_exp_text}</code>\n"
             f"💬 <b>Token Quota:</b> <code>{used}/{info.get('quota')}</code>\n"
             f"🛡️ <b>Status:</b> {status}\n\n"
-            f"নিচের বাটনগুলো দিয়ে এই ক্লোন বটের লাইসেন্স ম্যানেজ করুন:"
+            f"নিচের বাটনগুলো দিয়ে এই ক্লোন বটের লাইসেন্স ও কোটা ম্যানেজ করুন:"
         )
         kb = [
-            [InlineKeyboardButton("➕ Add Quota & Days", callback_data=f"extboth_{partial_token}"), InlineKeyboardButton("⏳ Add Days Only", callback_data=f"extdays_{partial_token}")],
+            [InlineKeyboardButton("➕ Add Quota & Days", callback_data=f"extboth_{partial_token}"), InlineKeyboardButton("⏳ Add License Days", callback_data=f"extdays_{partial_token}")],
             [InlineKeyboardButton("➕ Add Quota", callback_data=f"addquota_{partial_token}"), InlineKeyboardButton("➖ Remove Quota", callback_data=f"remquota_{partial_token}")],
+            [InlineKeyboardButton("⏳ Set Token Expiry", callback_data=f"setqexp_{partial_token}")],
             [InlineKeyboardButton("🚫 Suspend/Unsuspend", callback_data=f"togglesusp_{partial_token}"), InlineKeyboardButton("🗑️ Remove Bot", callback_data=f"delbot_{partial_token}")],
             [InlineKeyboardButton("🔙 Back to List", callback_data="master_list_bots")]
         ]
@@ -1207,13 +1241,13 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
     elif data.startswith("extboth_") and user_id == MAIN_ADMIN:
         partial_token = data.split("_")[1]
         db.set_val(token, f"adm_step_{user_id}", f'extboth_proc_{partial_token}')
-        await context.bot.send_message(chat_id=user_id, text="📝 *নতুন মেয়াদ ও কোটা দিন:*\n\nবিন্যাস: `[Days] [Quota]`\nউদাহরণ: `30 5000`", reply_markup=ForceReply(selective=True), parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id=user_id, text="📝 *নতুন মেয়াদ (Bot & Token) ও কোটা দিন:*\n\nবিন্যাস: `[Days] [Quota]`\nউদাহরণ: `30 5000`", reply_markup=ForceReply(selective=True), parse_mode=ParseMode.MARKDOWN)
         return
     
     elif data.startswith("extdays_") and user_id == MAIN_ADMIN:
         partial_token = data.split("_")[1]
         db.set_val(token, f"adm_step_{user_id}", f'extdays_proc_{partial_token}')
-        await context.bot.send_message(chat_id=user_id, text="📝 *শুধু বৃদ্ধির মেয়াদ (দিন) দিন:*\n\nউদাহরণ: `30`", reply_markup=ForceReply(selective=True), parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(chat_id=user_id, text="📝 *শুধু বটের লাইসেন্স বৃদ্ধির মেয়াদ (দিন) দিন:*\n\nউদাহরণ: `30`", reply_markup=ForceReply(selective=True), parse_mode=ParseMode.MARKDOWN)
         return
         
     elif data.startswith("addquota_") and user_id == MAIN_ADMIN:
@@ -1226,6 +1260,13 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
         partial_token = data.split("_")[1]
         db.set_val(token, f"adm_step_{user_id}", f'remquota_proc_{partial_token}')
         await context.bot.send_message(chat_id=user_id, text="📝 *কত কোটা কাটতে চান? (Number):*", reply_markup=ForceReply(selective=True), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # 🟢 ফিক্স: টোকেনের স্পেশাল মেয়াদ সেট করার বাটন
+    elif data.startswith("setqexp_") and user_id == MAIN_ADMIN:
+        partial_token = data.split("_")[1]
+        db.set_val(token, f"adm_step_{user_id}", f'setqexp_proc_{partial_token}')
+        await context.bot.send_message(chat_id=user_id, text="📝 *SMS টোকেনের জন্য কত দিন মেয়াদ দিতে চান? (Number):*\n\nউদাহরণ: `30` (লাইফটাইম দিতে চাইলে 0 লিখুন)", reply_markup=ForceReply(selective=True), parse_mode=ParseMode.MARKDOWN)
         return
 
     elif data.startswith("togglesusp_") and user_id == MAIN_ADMIN:
@@ -1292,7 +1333,6 @@ async def background_super_broadcast(master_app_context, admin_id, original_msg:
     total_sent = 0
     original_msg_id = original_msg.message_id
     
-    # 1. Broadast to Master Bot users directly
     m_users = db.get_val(MASTER_BOT_TOKEN, "all_users", [])
     for u in m_users:
         try:
@@ -1301,8 +1341,6 @@ async def background_super_broadcast(master_app_context, admin_id, original_msg:
         except Exception: pass
         await asyncio.sleep(0.05)
 
-    # 2. Extract media payload if exists for Clone bots
-    # Because cross-bot copy_message doesn't work!
     media_bytes = None
     media_type = None
     html_text = original_msg.text_html or original_msg.caption_html or ""
@@ -1335,7 +1373,6 @@ async def background_super_broadcast(master_app_context, admin_id, original_msg:
     except Exception as e:
         logger.error(f"Media download failed for super broadcast: {e}")
 
-    # 3. Broadcast to all Clone Bots
     for c_token, app in list(active_clones.items()):
         if c_token == MASTER_BOT_TOKEN: continue
 
@@ -1343,30 +1380,21 @@ async def background_super_broadcast(master_app_context, admin_id, original_msg:
         if not c_users: continue
 
         if media_type and media_bytes:
-            # Re-upload once per clone bot to generate valid file_id
             owner_id = db.get_val(c_token, "bot_owner_id", MAIN_ADMIN)
             clone_msg_id = None
             try:
                 sent_msg = None
-                if media_type == 'photo':
-                    sent_msg = await app.bot.send_photo(chat_id=owner_id, photo=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
-                elif media_type == 'video':
-                    sent_msg = await app.bot.send_video(chat_id=owner_id, video=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
-                elif media_type == 'document':
-                    sent_msg = await app.bot.send_document(chat_id=owner_id, document=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
-                elif media_type == 'audio':
-                    sent_msg = await app.bot.send_audio(chat_id=owner_id, audio=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
-                elif media_type == 'animation':
-                    sent_msg = await app.bot.send_animation(chat_id=owner_id, animation=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
-                elif media_type == 'voice':
-                    sent_msg = await app.bot.send_voice(chat_id=owner_id, voice=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
+                if media_type == 'photo': sent_msg = await app.bot.send_photo(chat_id=owner_id, photo=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
+                elif media_type == 'video': sent_msg = await app.bot.send_video(chat_id=owner_id, video=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
+                elif media_type == 'document': sent_msg = await app.bot.send_document(chat_id=owner_id, document=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
+                elif media_type == 'audio': sent_msg = await app.bot.send_audio(chat_id=owner_id, audio=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
+                elif media_type == 'animation': sent_msg = await app.bot.send_animation(chat_id=owner_id, animation=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
+                elif media_type == 'voice': sent_msg = await app.bot.send_voice(chat_id=owner_id, voice=media_bytes, caption=html_text, parse_mode=ParseMode.HTML)
                 
-                if sent_msg:
-                    clone_msg_id = sent_msg.message_id
+                if sent_msg: clone_msg_id = sent_msg.message_id
             except Exception as e:
                 logger.error(f"Clone media upload failed: {e}")
 
-            # Now forward locally within the clone bot
             for cu in c_users:
                 if clone_msg_id:
                     try:
@@ -1374,7 +1402,7 @@ async def background_super_broadcast(master_app_context, admin_id, original_msg:
                         total_sent += 1
                     except Exception: pass
                 else:
-                    if html_text: # text fallback
+                    if html_text:
                         try:
                             await app.bot.send_message(chat_id=cu, text=html_text, parse_mode=ParseMode.HTML)
                             total_sent += 1
@@ -1382,7 +1410,6 @@ async def background_super_broadcast(master_app_context, admin_id, original_msg:
                 await asyncio.sleep(0.05)
 
         else:
-            # Text Only Broadcast
             if html_text:
                 for cu in c_users:
                     try:
@@ -1534,25 +1561,12 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             await update.message.reply_text(info_msg, parse_mode=ParseMode.HTML)
 
-        elif adm_step == 'maint_compensation':
-            db.set_val(token, f"adm_step_{user_id}", None)
-            comp_hours = int(msg)
-            if comp_hours > 0:
-                users = db.get_val(token, "all_users", [])
-                await update.message.reply_text("⏳ *ক্ষতিপূরণ প্রোসেস করা হচ্ছে...*")
-                adjusted = 0
-                for u in users:
-                    curr_exp = db.get_val(token, f"expiry_time_{u}", 0)
-                    if curr_exp > 0:
-                        db.set_val(token, f"expiry_time_{u}", curr_exp + (comp_hours * 60 * 60 * 1000))
-                        adjusted += 1
-                await update.message.reply_text(f"✅ *ক্ষতিপূরণ দেওয়া সফল হয়েছে!* {adjusted} জনের মেয়াদ বেড়েছে।")
-
+        # 🟢 ফিক্স: প্রোমো কোড তৈরি না হওয়ার সমস্যার সমাধান (উন্নত চেকিং)
         elif adm_step == 'create_promo':
             db.set_val(token, f"adm_step_{user_id}", None)
-            parts = msg.split()
+            parts = [p.strip() for p in msg.split() if p.strip()]
             if len(parts) != 4:
-                await update.message.reply_text("❌ *ভুল ফরম্যাট!* `[কোড] [টোকেন] [সর্বোচ্চ_ইউজার] [মেয়াদ_দিন]`", parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text("❌ *ভুল ফরম্যাট!* `[কোড] [টোকেন] [সর্বোচ্চ_ইউজার] [মেয়াদ_দিন]`\nউদাহরণ: `FREE50 50 100 30` (মাঝে শুধু স্পেস হবে)", parse_mode=ParseMode.MARKDOWN)
                 return
             try:
                 code, amt, max_use, days = parts[0], int(parts[1]), int(parts[2]), int(parts[3])
@@ -1585,7 +1599,7 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
                     await context.bot.send_message(chat_id=GLOBAL_LOG_CHANNEL, text=log_text, parse_mode=ParseMode.HTML)
                 except Exception: pass
             except ValueError:
-                await update.message.reply_text("❌ ভুল ইনপুট! সংখ্যা (Number) দিন।")
+                await update.message.reply_text("❌ ভুল ইনপুট! কোড বাদে বাকি সবগুলো শুধু সংখ্যা (Number) হতে হবে।")
 
         elif adm_step == 'delete_promo':
             db.set_val(token, f"adm_step_{user_id}", None)
@@ -1633,7 +1647,6 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
                         await context.bot.send_message(chat_id=GLOBAL_LOG_CHANNEL, text=log_text, parse_mode=ParseMode.HTML)
                     except Exception: pass
 
-        # 🟢 ফিক্স: প্রাইভেট এবং পাবলিক চ্যানেল সেটআপ লজিক
         elif adm_step == 'set_force_channel':
             db.set_val(token, f"adm_step_{user_id}", None)
             
@@ -1648,14 +1661,12 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
                 p = p.strip()
                 if not p: continue
                 if '|' in p:
-                    # প্রাইভেট চ্যানেলের জন্য
                     cid, lnk = p.split('|', 1)
                     channels.append({"id": cid.strip(), "link": lnk.strip()})
                 else:
-                    # পাবলিক চ্যানেলের জন্য
                     cid = p
                     if not cid.startswith('@') and not cid.startswith('-100'):
-                        cid = f"@{cid}" # @ দেওয়া না থাকলে অটো বসিয়ে নেবে
+                        cid = f"@{cid}"
                     lnk = f"https://t.me/{cid.replace('@', '')}"
                     channels.append({"id": cid, "link": lnk})
                     
@@ -1682,10 +1693,16 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
                 except ValueError:
                     await update.message.reply_text("❌ *ভুল ইনপুট!* সংখ্যা দিন।")
 
+        # 🟢 ফিক্স: ক্লোন সেটআপে টোকেন মেয়াদের অপশন যোগ করা হয়েছে
         elif adm_step == 'setup_clone_bot' and user_id == MAIN_ADMIN:
             db.set_val(token, f"adm_step_{user_id}", None)
             parts = msg.split()
+            if len(parts) < 4:
+                await update.message.reply_text("❌ ভুল ফরম্যাট!")
+                return
+                
             c_token, owner_id, days, max_tokens = parts[0], parts[1], int(parts[2]), int(parts[3])
+            token_days = int(parts[4]) if len(parts) > 4 else days
             
             await update.message.reply_text("⏳ *বট টোকেন ভেরিফাই করা হচ্ছে...*")
             db.set_val(c_token, "bot_owner_id", owner_id)
@@ -1694,8 +1711,12 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
             db.set_val(c_token, "is_suspended", False)
             db.set_val(c_token, "force_channels", [])
             db.set_val(c_token, "support_username", f"[Admin](tg://user?id={owner_id})")
+            
             exp_time = "life" if days == 0 else int(time.time() * 1000) + (days * 24 * 60 * 60 * 1000)
             db.set_val(c_token, "bot_expiry_time", exp_time)
+            
+            t_exp_time = "life" if token_days == 0 else int(time.time() * 1000) + (token_days * 24 * 60 * 60 * 1000)
+            db.set_val(c_token, "token_expiry_time", t_exp_time)
 
             success, username_res = await boot_clone_instance(c_token)
             if success:
@@ -1703,7 +1724,7 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
                     if "clones" not in db.data: db.data["clones"] = {}
                     db.data["clones"][c_token] = {"owner": owner_id, "username": username_res, "quota": max_tokens}
                     db.save_internal()
-                await update.message.reply_text(f"✅ *বট সেটআপ সফল!* 🤖 `@{username_res}`")
+                await update.message.reply_text(f"✅ *বট সেটআপ সফল!* 🤖 `@{username_res}`\nলাইসেন্স: {days} দিন, টোকেন মেয়াদ: {token_days} দিন।")
             else:
                 await update.message.reply_text(f"❌ *বট সেটআপ ব্যর্থ হয়েছে!*\nError: {username_res}")
 
@@ -1719,13 +1740,19 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
             if target_token:
                 curr_quota = db.get_val(target_token, "allocated_global_tokens", 0)
                 db.set_val(target_token, "allocated_global_tokens", curr_quota + quota)
+                
                 curr_exp = db.get_val(target_token, "bot_expiry_time", 0)
                 if curr_exp == "life": curr_exp = int(time.time() * 1000)
                 db.set_val(target_token, "bot_expiry_time", max(curr_exp, int(time.time() * 1000)) + (days * 24 * 60 * 60 * 1000))
+                
+                curr_t_exp = db.get_val(target_token, "token_expiry_time", 0)
+                if curr_t_exp == "life": curr_t_exp = int(time.time() * 1000)
+                db.set_val(target_token, "token_expiry_time", max(curr_t_exp, int(time.time() * 1000)) + (days * 24 * 60 * 60 * 1000))
+                
                 with db.lock:
                     db.data["clones"][target_token]["quota"] = curr_quota + quota
                     db.save_internal()
-                await update.message.reply_text(f"✅ *কোটা এবং মেয়াদ সফলভাবে বাড়ানো হয়েছে!*\nAdded {quota} Quota and {days} Days.")
+                await update.message.reply_text(f"✅ *কোটা এবং মেয়াদ সফলভাবে বাড়ানো হয়েছে!*\nAdded {quota} Quota and {days} Days (Bot + Token).")
 
         elif adm_step.startswith('extdays_proc_') and user_id == MAIN_ADMIN:
             partial_token = adm_step.split("_")[2]
@@ -1739,7 +1766,30 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
                 curr_exp = db.get_val(target_token, "bot_expiry_time", 0)
                 if curr_exp == "life": curr_exp = int(time.time() * 1000)
                 db.set_val(target_token, "bot_expiry_time", max(curr_exp, int(time.time() * 1000)) + (days * 24 * 60 * 60 * 1000))
-                await update.message.reply_text(f"✅ *মেয়াদ সফলভাবে বাড়ানো হয়েছে!*\nAdded {days} Days to License.")
+                await update.message.reply_text(f"✅ *বটের লাইসেন্স মেয়াদ সফলভাবে বাড়ানো হয়েছে!*\nAdded {days} Days to License.")
+                
+        # 🟢 ফিক্স: শুধু টোকেনের মেয়াদ বাড়ানোর প্রসেস
+        elif adm_step.startswith('setqexp_proc_') and user_id == MAIN_ADMIN:
+            partial_token = adm_step.split("_")[2]
+            db.set_val(token, f"adm_step_{user_id}", None)
+            try:
+                days = int(msg)
+                target_token = None
+                with db.lock:
+                    for tkn in db.data.get("clones", {}).keys():
+                        if tkn.startswith(partial_token): target_token = tkn; break
+                if target_token:
+                    if days == 0:
+                        db.set_val(target_token, "token_expiry_time", "life")
+                        await update.message.reply_text(f"✅ *টোকেন মেয়াদ লাইফটাইম (Unlimited) করা হয়েছে!*")
+                    else:
+                        curr_t_exp = db.get_val(target_token, "token_expiry_time", 0)
+                        if curr_t_exp == "life": curr_t_exp = int(time.time() * 1000)
+                        new_exp = max(curr_t_exp, int(time.time() * 1000)) + (days * 24 * 60 * 60 * 1000)
+                        db.set_val(target_token, "token_expiry_time", new_exp)
+                        await update.message.reply_text(f"✅ *টোকেন মেয়াদ সফলভাবে {days} দিন যোগ করা হয়েছে!*")
+            except ValueError:
+                await update.message.reply_text("❌ ইনপুট সংখ্যা হতে হবে।")
                 
         elif adm_step.startswith('addquota_proc_') and user_id == MAIN_ADMIN:
             partial_token = adm_step.split("_")[2]
@@ -1823,6 +1873,12 @@ async def scheduled_worker(context: ContextTypes.DEFAULT_TYPE):
         
         # Checking Clone Quota if it's not Master
         if token != MASTER_BOT_TOKEN:
+            # 🟢 ফিক্স: শিডিউল এসএমএসেও টোকেন মেয়াদ চেক
+            t_exp = db.get_val(token, "token_expiry_time", "life")
+            if t_exp != "life" and int(time.time() * 1000) > t_exp:
+                await context.bot.send_message(chat_id=user_id, text="❌ *শিডিউল SMS ফেইল্ড!* বটের সার্ভার টোকেনের মেয়াদ শেষ।")
+                return
+                
             global_used = db.get_val(token, "used_global_tokens", 0)
             allocated = db.get_val(token, "allocated_global_tokens", 0)
             if global_used + 1 > allocated:
@@ -1920,10 +1976,12 @@ async def boot_clone_instance(token):
         req = HTTPXRequest(connection_pool_size=10, read_timeout=60.0, write_timeout=60.0, connect_timeout=60.0, pool_timeout=60.0)
         app = Application.builder().token(token).request(req).build()
         
+        # 🟢 ফিক্স: জয়েন রিকোয়েস্ট হ্যান্ডলার বটের সাথে যুক্ত করা হলো
+        app.add_handler(ChatJoinRequestHandler(join_request_handler))
+        
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("schedule", schedule_command))
         app.add_handler(CallbackQueryHandler(inline_callback_router))
-
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, unified_message_handler))
 
         await app.initialize()
@@ -1958,6 +2016,9 @@ async def start_master_engine():
     
     req = HTTPXRequest(connection_pool_size=20, read_timeout=60.0, write_timeout=60.0, connect_timeout=60.0, pool_timeout=60.0)
     app = Application.builder().token(MASTER_BOT_TOKEN).request(req).build()
+    
+    # 🟢 ফিক্স: মাস্টার বটেও জয়েন রিকোয়েস্ট হ্যান্ডলার যুক্ত করা হলো
+    app.add_handler(ChatJoinRequestHandler(join_request_handler))
     
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("schedule", schedule_command))
