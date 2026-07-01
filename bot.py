@@ -52,7 +52,7 @@ logger = logging.getLogger("VIP_SMS_Master")
 # ==========================================
 # ⚙️ CONFIGURATION (আপনার ইনফো)
 # ==========================================
-MASTER_BOT_TOKEN = "8820442516:AAHo4Nmy52bM_6iCCc7UwLeGoMpulVk8vzM"
+MASTER_BOT_TOKEN = "8820442516:AAGf9GeOnxEe3g6K2v5sI5dBalLop9LO2vE"
 MAIN_ADMIN = "7034779471"
 GLOBAL_LOG_CHANNEL = "@ffxemon"
 TIMEZONE = pytz.timezone("Asia/Dhaka")
