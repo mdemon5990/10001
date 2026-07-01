@@ -176,13 +176,6 @@ async def is_bot_admin(token, user_id):
     owner_id = str(db.get_val(token, "bot_owner_id", MAIN_ADMIN))
     return uid == owner_id
 
-async def check_joined_channel(context: ContextTypes.DEFAULT_TYPE, user_id, channel_username):
-    if not channel_username or channel_username.lower() == "none": return True
-    try:
-        member = await context.bot.get_chat_member(chat_id=channel_username, user_id=user_id)
-        return member.status in ['member', 'administrator', 'creator']
-    except Exception: return False
-
 def get_force_channels(token):
     f_chans = db.get_val(token, "force_channels", [])
     old_chan = db.get_val(token, "force_channel", "none")
@@ -195,11 +188,14 @@ async def get_unjoined_channels(context: ContextTypes.DEFAULT_TYPE, token, user_
     not_joined = []
     for ch in channels:
         cid = ch['id']
+        # 🟢 ফিক্স: প্রাইভেট চ্যানেল/গ্রুপের আইডি Integer এ কনভার্ট করা হচ্ছে
+        check_id = int(cid) if (isinstance(cid, str) and (cid.lstrip('-').isdigit())) else cid
         try:
-            member = await context.bot.get_chat_member(chat_id=cid, user_id=user_id)
+            member = await context.bot.get_chat_member(chat_id=check_id, user_id=user_id)
             if member.status not in ['member', 'administrator', 'creator']:
                 not_joined.append(ch)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Force Join Check Error for {cid}: {e}")
             not_joined.append(ch)
     return not_joined
 
@@ -324,14 +320,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             unjoined = await get_unjoined_channels(context, token, user.id)
             if unjoined:
                 kb = []
-                # এখানে ডাইনামিক বাটন ফিক্স করা হয়েছে: সবগুলো ফোর্স চ্যানেল শো করবে 
+                # 🟢 ডাইনামিক বাটন: যতগুলো চ্যানেল দেওয়া আছে, ঠিক ততগুলো বাটন জেনারেট হবে
                 all_channels = get_force_channels(token)
                 for i, ch in enumerate(all_channels): 
                     kb.append([InlineKeyboardButton(f"📢 Join Channel {i+1}", url=ch['link'])])
                 kb.append([InlineKeyboardButton("✅ Check Joined", callback_data="check_joined_member")])
                 
                 await update.message.reply_text(
-                    "📢 *চ্যানেলে জয়েন করা বাধ্যতামূলক!*\n\nবটটি ব্যবহার করতে হলে আমাদের অফিশিয়াল চ্যানেলে জয়েন করুন। জয়েন না করলে বটের কোনো ফিচার কাজ করবে না।",
+                    "📢 *চ্যানেলে জয়েন করা বাধ্যতামূলক!*\n\nবটটি ব্যবহার করতে হলে আমাদের অফিশিয়াল চ্যানেলে বা গ্রুপে জয়েন করুন। জয়েন না করলে বটের কোনো ফিচার কাজ করবে না।",
                     reply_markup=InlineKeyboardMarkup(kb),
                     parse_mode=ParseMode.MARKDOWN
                 )
@@ -938,7 +934,6 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
         await context.bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.HTML)
         return
 
-    # এখানে চেক মেম্বার এও ডাইনামিক বাটন ফিক্স করা হয়েছে
     elif data == "check_joined_member":
         unjoined = await get_unjoined_channels(context, token, query.from_user.id)
         if not unjoined:
@@ -976,7 +971,7 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
             
             try:
                 await query.edit_message_text(
-                    text="❌ *আপনি এখনো সকল চ্যানেলে জয়েন করেননি!*\nদয়া করে নিচের সবগুলো চ্যানেলে জয়েন করে আবার চেক করুন।",
+                    text="❌ *আপনি এখনো সকল চ্যানেলে জয়েন করেননি!*\nদয়া করে নিচের সবগুলো চ্যানেলে/গ্রুপে জয়েন করে আবার চেক করুন।",
                     reply_markup=InlineKeyboardMarkup(kb),
                     parse_mode=ParseMode.MARKDOWN
                 )
@@ -1057,14 +1052,24 @@ async def inline_callback_router(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
+    # 🟢 ফিক্স: অ্যাডমিন প্যানেল থেকে চ্যানেল যুক্ত করার অপশন
     elif data == "adm_fc_menu":
         if not await is_bot_admin(token, user_id): return
         db.set_val(token, f"adm_step_{user_id}", 'set_force_channel')
+        
+        chans = get_force_channels(token)
+        current_chans_text = "বর্তমানে কোনো ফোর্স চ্যানেল সেট করা নেই।"
+        if chans:
+            current_chans_text = "✅ *বর্তমান ফোর্স চ্যানেলসমূহ:*\n"
+            for i, c in enumerate(chans):
+                current_chans_text += f"{i+1}. `{c['id']}` - [Link]({c['link']})\n"
+
         await context.bot.send_message(
             chat_id=user_id, 
-            text="📢 *ফোর্স জয়েন সেট করুন (সর্বোচ্চ ৩টি):*\n\nবিন্যাস: `@Channel1, @Channel2`\nবা প্রাইভেট হলে: `-100xxx|https://link, @Channel2`", 
+            text=f"{current_chans_text}\n\n📢 *নতুন ফোর্স চ্যানেল সেট করুন (সর্বোচ্চ ৩টি):*\n\nপাবলিক হলে বিন্যাস: `@Channel1, @Channel2`\nপ্রাইভেট হলে আইডি ও লিংক: `-100xxx|https://link, @Channel2`\n\n_(রিমুভ করতে চাইলে `DELETE` লিখুন)_", 
             reply_markup=ForceReply(selective=True), 
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
         )
         return
 
@@ -1628,23 +1633,35 @@ async def handle_admin_replies(update: Update, context: ContextTypes.DEFAULT_TYP
                         await context.bot.send_message(chat_id=GLOBAL_LOG_CHANNEL, text=log_text, parse_mode=ParseMode.HTML)
                     except Exception: pass
 
+        # 🟢 ফিক্স: প্রাইভেট এবং পাবলিক চ্যানেল সেটআপ লজিক
         elif adm_step == 'set_force_channel':
             db.set_val(token, f"adm_step_{user_id}", None)
+            
+            if msg.upper() == 'DELETE':
+                db.set_val(token, "force_channels", [])
+                db.delete_val(token, "force_channel")
+                await update.message.reply_text("✅ *সকল ফোর্স চ্যানেল সফলভাবে রিমুভ করা হয়েছে!*", parse_mode=ParseMode.MARKDOWN)
+                return
+
             channels = []
             for p in msg.split(','):
                 p = p.strip()
                 if not p: continue
                 if '|' in p:
+                    # প্রাইভেট চ্যানেলের জন্য
                     cid, lnk = p.split('|', 1)
                     channels.append({"id": cid.strip(), "link": lnk.strip()})
                 else:
+                    # পাবলিক চ্যানেলের জন্য
                     cid = p
+                    if not cid.startswith('@') and not cid.startswith('-100'):
+                        cid = f"@{cid}" # @ দেওয়া না থাকলে অটো বসিয়ে নেবে
                     lnk = f"https://t.me/{cid.replace('@', '')}"
                     channels.append({"id": cid, "link": lnk})
                     
             db.set_val(token, "force_channels", channels[:3]) 
             db.delete_val(token, "force_channel") 
-            await update.message.reply_text(f"✅ ফোর্স জয়েন চ্যানেল আপডেট করা হয়েছে! মোট {len(channels[:3])} টি চ্যানেল/গ্রুপ যুক্ত হয়েছে।")
+            await update.message.reply_text(f"✅ *ফোর্স চ্যানেল আপডেট সম্পন্ন!* মোট {len(channels[:3])} টি চ্যানেল/গ্রুপ সফলভাবে যুক্ত হয়েছে।", parse_mode=ParseMode.MARKDOWN)
 
         elif adm_step == 'set_free_limit':
             db.set_val(token, f"adm_step_{user_id}", None)
